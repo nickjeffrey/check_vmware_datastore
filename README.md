@@ -6,10 +6,10 @@ perl, curl, low-privilege read-only nagios userid on vCenter server, vCenter 6.7
 
 # Preparation
 Create a user called nagios in vCenter
-<img src=images/vcenter_create_user.png>
+<br><img src=images/vcenter_create_user.png>
 
 Assign the Read-Only role.  This makes the nagios user on vCenter a low-privilege read-only role that cannot make any changes to vCenter.
-<img src=images/vcenter_user_role.png>
+<br><img src=images/vcenter_user_role.png>
 
 
 Create the /usr/local/nagios/etc/private/vcenter.auth file with the credentials for the above user
@@ -38,4 +38,4 @@ define command {
 
 
 # Output
-<img src=images/output.png>
+<br><img src=images/output.png>
