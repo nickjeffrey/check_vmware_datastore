@@ -8,12 +8,14 @@
 # OUSTANDING TASKS
 # ----------------
 # document how/why --warn=10 --critical=5 values are in %, consider adding GB option
-
+# add an --exclude switch to skip specific datastore(s)
 
 
 # CHANGE LOG
 # ----------
 #  2022/04/14	njeffrey	Script created
+#  2022/04/27	njeffrey	Adjust regex to allow [\(\) ] in datastore names
+#  2022/04/27	njeffrey	Add --include=xxx --exclude=xxx parameters
 
 
 # NOTES
@@ -37,18 +39,18 @@
 #      # 'check_vmware_datastore' command definition
 #      define command {
 #             command_name    check_vmware_datastore
-#             command_line    $USER1$/check_vmware_api $HOSTADDRESS$ 
+#             command_line    $USER1$/check_vmware_api --host=$HOSTADDRESS$ --warn=$ARG1$ --crit=$ARG2$ --include=$ARG3$ --exclude=$ARG4$
 #             }
 #
 #
 #
 #   3) You will need a section similar to the following in the services.cfg file on the nagios server.
 #      define service {
+#              # syntax is check_vmware_datastore!warn%free!crit%free!include1,include2,include3!exclude1,exclude2,exclude3
 #              use                             generic-24x7-service
 #              host_name                       vmhost1.example.com
 #              service_description             VMWare datastores 
-#              check_interval                  30              ; Actively check the host every 30 minutes
-#              check_command                   check_vmware_datastore
+#              check_command                   check_vmware_datastore!10!5
 #              }
 
 
@@ -70,13 +72,12 @@ use Getopt::Long;                       			#allow --long-switches to be used as 
 
 
 my ($host,$username,$password);
-my (%datastores,$datastore,$datastore_count);
+my (%datastores,$datastore_count,$datastore_name,$include,$exclude,@included_datastores,@excluded_datastores);
+my ($datastores_ok,$datastores_warn,$datastores_critical,$datastores_unknown);
 my ($total_tb,$free_tb,$used_tb);
 my ($total_pct,$free_pct,$used_pct,$thresh_warn,$thresh_crit);
-my ($opt_w,$opt_c,$opt_h,$opt_H,$opt_v,$opt_d,$verbose);
+my ($opt_w,$opt_c,$opt_h,$opt_H,$opt_v,$opt_i,$opt_x,$verbose);
 my ($sessionid,$curl,$ping,$nslookup,$nslookup_status,$cmd,$key,$common_output_data);
-my ($output_message,$output_filename,$output_file_age);
-my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
 my ($credsfile,$perf_data);
 my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
 #
@@ -116,7 +117,8 @@ sub get_options {
       "w=i" => \$opt_w, "warn=i"      => \$opt_w,
       "c=i" => \$opt_c, "critical=i"  => \$opt_c,
       "H=s" => \$opt_H, "host=s"      => \$opt_H,
-      "d=s" => \$opt_d, "datastore=s" => \$opt_d,
+      "i=s" => \$opt_i, "include=s"   => \$opt_i,
+      "x=s" => \$opt_x, "exclude=s"   => \$opt_x,
    );
    #
    #
@@ -126,8 +128,14 @@ sub get_options {
    if( (defined($opt_h)) || (!defined($opt_H)) ) {
       print "Nagios plugin for determining filesystem usage. \n";
       print "Examples: \n";
-      print "   $0 --help    \n";
-      print "   $0 --verbose --host=vcenter01.example.com --warn=10 --critical=5 --datastore=mydatastore \n";
+      print "   $0     \n";
+      print "       --host=vcenter01.example.com    (this is the only mandatory parameter) \n";
+      print "       --warn=10                       (warn on remaining % free, default=10)\n";
+      print "       --critical=5                    (crit on remaining % free, default=5) \n";           
+      print "       --help                          (show this help)\n";
+      print "       --verbose                       (increase output verbosity for debugging)\n";
+      print "       --include=datastore1,datastore2 (optional, all datastores included by default)\n";
+      print "       --exclude=datastore4,datastore5 (optional, no  datastores excluded by default)\n";
       print "\n\n";
       exit $UNKNOWN;
    }
@@ -139,9 +147,16 @@ sub get_options {
       $host = $opt_H;
    }
    #
-   # If the user supplied -d or --datastore=xxx switch, define the vCenter host we willc connect to
-   if( defined( $opt_d ) ) {
-      $datastore = $opt_d;
+   # If the user supplied -i or --include=xxx switch, capture the specific datastores to be include
+   if( defined( $opt_i ) ) {
+      $include = $opt_i;
+      @included_datastores = split /,/,$include;  #break out the comma separated list of datastores into array elements
+   }
+   #
+   # If the user supplied -x or --exclude=xxx switch, capture the specific datastores to be exclude
+   if( defined( $opt_x ) ) {
+      $exclude = $opt_x;
+      @excluded_datastores = split /,/,$exclude;  #break out the comma separated list of datastores into array elements
    }
    #
    # If the user supplied -v or --verbose switch, use verbose output for debugging
@@ -353,13 +368,17 @@ sub get_datastores {
    $cmd = "$curl -k -X GET -H \"vmware-api-session-id: $sessionid\" https://$host/rest/vcenter/datastore ";			#define command to be run
    print "   running $cmd \n" if ($verbose eq "yes");
    open (IN,"$cmd 2>&1|");                             	#open filehandle using command output
+   #open (IN,"/tmp/datastores.txt") or die "Cannot open /tmp/datastores.txt for reading $! \n";
    while (<IN>) {                                       #read a line from filehandle
       s/"//g;						#get rid of " characters to make the regex simpler
+      s/ /_/g;						#change any spaces in datastore names to underscores       to simplify regex
+      s/\(/_/g;						#change any ( characters in datastore names to underscores to simplify regex
+      s/\)/_/g;						#change any ) characters in datastore names to underscores to simplify regex
       s/\{value:\[//g;					#get rid of header
       s/\]\}//g;					#get rid of footer
       s/\{//g;						#get rid of opening { 
-      s/\}/____/g;					#replace closing } with ____ , which will be used as a unique identifier for splitting up each datastore 
-      @_ = split /____/,$_;				#split the XML output on the arbitrary ____ string, putting each chunk of data into a separate array element
+      s/\}/\n/g;					#replace closing } with \n new line character , which will be used as a unique identifier for splitting up each datastore 
+      @_ = split /\n/,$_;				#split the XML output on the arbitrary \n string, putting each chunk of data into a separate array element
    }							#end of while loop
    close IN;						#close filehandle
    #
@@ -396,25 +415,86 @@ sub get_datastores {
          $datastores{$1}{used_pct} = 100 - $datastores{$1}{free_pct}; 				#convert to percentage
          $datastores{$1}{used_pct} = sprintf("%.1f",$datastores{$1}{used_pct});		  	#truncate to 1 decimal place
          #
-         print "   id=$datastores{$1}{id} name=$datastores{$1}{name} type=$datastores{$1}{type} capacity=$datastores{$1}{capacity_tb}TB used=$datastores{$1}{used_tb}TB ($datastores{$1}{used_pct}\%), free=$datastores{$1}{free_tb}TB ($datastores{$1}{free_pct}\%) \n" if ($verbose eq "yes");
+         # Figure out if the datastore current space utilization is ok|warn|crit
+         #
+         if ( $datastores{$1}{free_pct} >= $thresh_warn ) {
+            $datastores{$1}{status} = "ok";		  					#save a hash element describing the current status of the datastore
+         }
+         if ( $datastores{$1}{free_pct} < $thresh_warn ) {
+            $datastores{$1}{status} = "warn";		  					#save a hash element describing the current status of the datastore
+         }
+         if ( $datastores{$1}{free_pct} < $thresh_crit ) {
+            $datastores{$1}{status} = "critical";		  				#save a hash element describing the current status of the datastore
+         }
+         #
+         print "   id=$datastores{$1}{id} name=$datastores{$1}{name} type=$datastores{$1}{type} capacity=$datastores{$1}{capacity_tb}TB used=$datastores{$1}{used_tb}TB ($datastores{$1}{used_pct}\%), free=$datastores{$1}{free_tb}TB ($datastores{$1}{free_pct}\%) status:$datastores{$1}{status} \n" if ($verbose eq "yes");
       }
    }
    close IN;                                            #close filehandle
    #
    # 
-   # By default, we assume that all datastors are being checked.
-   # However, if --datastore=xxx was provided as a command line parameter, only check that single datastore
+   # By default, we assume that all datastores are being checked.
+   # However, if --include=xxx was provided as a command line parameter, create a new hash that contains only the @included_datastores
    # 
-   if ( defined($datastore) ) {
+   if ( defined($include) ) {
+      my %datastores_included;				#define a temporary hash to hold the manually specified datastores
       foreach $key (keys %datastores) {
-         unless ( $datastores{$key}{name} eq "$datastore" ) {
-            delete($datastores{$key});			#delete this datastore from the hash    
-         }						#end of unless block
+         foreach $datastore_name (@included_datastores) {
+            if( $datastores{$key}{name} eq "$datastore_name" ) {
+               print "   adding this datastore to list of included datastores: $datastores{$key}{name} \n" if ($verbose eq "yes");
+               $datastores_included{$key}{id}          = $datastores{$key}{id};			#copy hash element to a new temporary hash
+               $datastores_included{$key}{name}        = $datastores{$key}{name};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{type}        = $datastores{$key}{type};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{status}      = $datastores{$key}{status};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{free_pct}    = $datastores{$key}{free_pct};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{used_pct}    = $datastores{$key}{used_pct};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{free_bytes}  = $datastores{$key}{free_bytes};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{used_bytes}  = $datastores{$key}{used_bytes};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{capacity}    = $datastores{$key}{capacity};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{free_tb}     = $datastores{$key}{free_tb};		#copy hash element to a new temporary hash
+               $datastores_included{$key}{used_tb}     = $datastores{$key}{used_tb};		#copy hash element to a new temporary hash	
+               $datastores_included{$key}{capacity_tb} = $datastores{$key}{capacity_tb};	#copy hash element to a new temporary hash
+            }						#end of unless block
+         }						#end of foreach loop
+      }							#end of foreach loop
+      #
+      # overwrite the hash containing all the datastores with the temporary hash %datastores_included
+      %datastores = %datastores_included;
+      undef %datastores_included;			#get rid of the temporary hash
+   } 							#end of if block
+   #
+   # 
+   # By default, we assume that all datastores are being checked.
+   # However, if --exclude=xxx was provided as a command line parameter, exclude that datastore(s) from 
+   # 
+   if ( defined($exclude) ) {
+      foreach $key (keys %datastores) {
+         foreach $datastore_name (@excluded_datastores) {
+            next unless $datastore_name;
+            next unless $datastores{$key}{name};
+            if( $datastores{$key}{name} eq "$datastore_name" ) {
+               print "   removing datastore from consideration: $datastores{$key}{name} \n" if ($verbose eq "yes");
+               delete($datastores{$key}{id});		#delete this datastore from the hash    
+               delete($datastores{$key}{name});		#delete this datastore from the hash    
+               delete($datastores{$key}{type});		#delete this datastore from the hash    
+               delete($datastores{$key}{status});	#delete this datastore from the hash    
+               delete($datastores{$key}{free_pct});	#delete this datastore from the hash    
+               delete($datastores{$key}{used_pct});	#delete this datastore from the hash    
+               delete($datastores{$key}{free_bytes});	#delete this datastore from the hash    
+               delete($datastores{$key}{used_bytes});	#delete this datastore from the hash    
+               delete($datastores{$key}{capacity});	#delete this datastore from the hash    
+               delete($datastores{$key}{free_tb});	#delete this datastore from the hash    
+               delete($datastores{$key}{used_tb});	#delete this datastore from the hash    
+               delete($datastores{$key}{capacity_tb});	#delete this datastore from the hash    
+               delete($datastores{$key});		#delete this datastore from the hash    
+            }						#end of unless block
+         }						#end of foreach loop
       }							#end of foreach loop
    } 							#end of if block
    # 
    # figure out the total number of datastores
    $datastore_count = keys %datastores;
+   print "   total datastore count is $datastore_count \n" if ($verbose eq "yes");
 } 							#end of subroutine 
 
 
@@ -430,15 +510,22 @@ sub print_output {
    #
    print "running print_output subroutine \n" if ($verbose eq "yes");
    #
+   #
+   $perf_data           = "";							#initialize variable
+   $common_output_data  = "";							#initialize variable
+   $datastores_ok       = "";							#initialize variable
+   $datastores_warn     = "";							#initialize variable
+   $datastores_critical = "";							#initialize variable
+   $datastores_unknown  = "";							#initialize variable
+   #
    # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
    # The format is:  label=value[UOM];[warn];[crit];[min];[max]
    # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
    # You can have multiple items of perf data, just separate each section with a space.
    # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
    # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes GB=gigabytes %=percent c=counter
-   $perf_data          = "";							#initialize variable
-   $common_output_data = "";							#initialize variable
    foreach $key (keys %datastores) {
+      next unless $datastores{$key}{name};					#skip any missing hash elements
       $perf_data = "$perf_data $datastores{$key}{name}_used_tb:$datastores{$key}{used_tb}TB;;;0;$datastores{$key}{capacity_tb}  $datastores{$key}{name}_used_pct:$datastores{$key}{used_pct}\%;;;0;100 "; 
    }
    #
@@ -448,28 +535,48 @@ sub print_output {
       exit $UNKNOWN;
    }							#end of if block
    foreach $key (keys %datastores) {
+      next unless $datastores{$key}{name};					#skip any missing hash elements
       $common_output_data = "$common_output_data , $datastores{$key}{name}:$datastores{$key}{used_tb}TB/$datastores{$key}{capacity_tb}TB($datastores{$key}{used_pct}\% used) "; 	#common text in each message
    }
    #
+   # find the ok|warn|critical|unknown status of each datastore
+   #
    foreach $key (keys %datastores) {
-      #next unless (  $datastores{$key}{free_pct} );	#skip any blank hash elements
-      unless ( $datastores{$key}{free_pct} ) {		#check to see if hash element is undefined
-         print "$CHECK_NAME UNKNOWN - Could not determine free space in datastore $datastores{$key}{name}.  $common_output_data | $perf_data \n";
+      next unless $datastores{$key}{name};					#skip any missing hash elements
+      unless ( $datastores{$key}{status} ) {		#check to see if hash element is undefined
+         print "$CHECK_NAME UNKNOWN - Could not determine ok|warn|critical status of free space in datastore $datastores{$key}{name}.  $common_output_data | $perf_data \n";
          exit $UNKNOWN;
       } 						#end of unless block
-      if ( $datastores{$key}{free_pct} < $thresh_crit ) {
-         print "$CHECK_NAME CRITICAL - Datastore $datastores{$key}{name} is low on space.  $common_output_data | $perf_data \n";
-         exit $CRITICAL;
+      if ( $datastores{$key}{status} eq "ok" ) {
+         $datastores_ok = "$datastores_ok $datastores{$key}{name}";
       }
-      if ( $datastores{$key}{free_pct} < $thresh_warn ) {
-         print  "$CHECK_NAME WARN - Datastore $datastores{$key}{name} is low on space.  $common_output_data | $perf_data \n";
-         exit $WARN;
+      if ( $datastores{$key}{status} eq "warn" ) {
+         $datastores_warn = "$datastores_warn $datastores{$key}{name} is $datastores{$key}{used_pct}\% full,";
+      }
+      if ( $datastores{$key}{status} eq "critical" ) {
+         $datastores_critical = "$datastores_critical $datastores{$key}{name} is $datastores{$key}{used_pct}\% full,";
+      }
+      if ( $datastores{$key}{status} eq "unknown" ) {
+         $datastores_unknown = "$datastores_unknown $datastores{$key}{name}";
       }
    }       
    #
+   # If any of the datastores status=critical, send alert 
+   #
+   if ( $datastores_critical =~ /a-zA-Z0-9/ ) {				#alert if anything found in $datastores_critical
+      print "$CHECK_NAME CRITICAL - $datastores_critical , $datastores_warn , $common_output_data | $perf_data \n";	#print output to screenstores_critical
+      exit $CRITICAL;
+   }
+   #
+   # If any of the datastores status=warn, send alert 
+   #
+   if ( $datastores_warn =~ /a-zA-Z0-9/ ) {				#alert if anything found in $datastores_critical
+      print "$CHECK_NAME WARN - $datastores_critical , $datastores_warn , $common_output_data | $perf_data \n";	#print output to screenstores_critical
+      exit $CRITICAL;
+   }
    # We only get this far if everything is ok
    #
-   print "$CHECK_NAME OK - $common_output_data | $perf_data \n";	#print output to screen
+   print "$CHECK_NAME OK - all datastores have sufficient free space.  $common_output_data | $perf_data \n";	#print output to screen
    exit $OK;
 }                                                                       #end of subroutine
 
