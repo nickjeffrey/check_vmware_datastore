@@ -21,6 +21,8 @@ password=SuperSecretPassword#123!
 Create a section similar to the following in the services.cfg file:
 ```
 define service {
+       # syntax is check_vmware_datastore!warn%free!crit%free!includeds1,includeds2!excludeds1,excludeds2
+       # all the additional parameters are optional
         use                             generic-service
         host_name                       vcenter01.example.com
         service_description             VMWare datastores
@@ -33,7 +35,7 @@ Create a section similar to the following in the commands.cfg file:
 # 'check_vmware_datastore' command definition
 define command {
        command_name    check_vmware_datastore
-       command_line    $USER1$/check_vmware_datastore --host=$HOSTADDRESS$
+       command_line    $USER1$/check_vmware_datastore --host=$HOSTADDRESS$  --warn=$ARG1$ --crit=$ARG2$ --include=$ARG3 --exclude=$ARG4$
        }
 ```
 
