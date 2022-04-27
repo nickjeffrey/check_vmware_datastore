@@ -46,11 +46,12 @@
 #
 #   3) You will need a section similar to the following in the services.cfg file on the nagios server.
 #      define service {
-#              # syntax is check_vmware_datastore!warn%free!crit%free!include1,include2,include3!exclude1,exclude2,exclude3
-#              use                             generic-24x7-service
+#              # syntax is check_vmware_datastore!warn%free!crit%free!includeds1,includeds2!excludeds1,excludeds2
+#              # all the additional parameters are optional
+#              use                             generic-service
 #              host_name                       vmhost1.example.com
 #              service_description             VMWare datastores 
-#              check_command                   check_vmware_datastore!10!5
+#              check_command                   check_vmware_datastore!10!5!includeds1,includeds2!excludeds3,excludeds4
 #              }
 
 
@@ -356,7 +357,7 @@ sub get_datastores {
    #
    print "running get_datastores subroutine \n" if ($verbose eq "yes");
    #
-   # The API request will return output similar to the following.  
+   # The API request will return output in JSON format similar to the following.  
    # Note that line breaks are only added for readability, the actual returned text will all be one line.
    # {"value":[
    #             {"datastore":"datastore-10683","name":"esx2_datastore2","type":"VMFS","free_space":2200181932032,"capacity":4000762036224},
@@ -368,9 +369,8 @@ sub get_datastores {
    $cmd = "$curl -k -X GET -H \"vmware-api-session-id: $sessionid\" https://$host/rest/vcenter/datastore ";			#define command to be run
    print "   running $cmd \n" if ($verbose eq "yes");
    open (IN,"$cmd 2>&1|");                             	#open filehandle using command output
-   #open (IN,"/tmp/datastores.txt") or die "Cannot open /tmp/datastores.txt for reading $! \n";
    while (<IN>) {                                       #read a line from filehandle
-      s/"//g;						#get rid of " characters to make the regex simpler
+      s/"//g;						#get rid of " characters in JSON outpout                    to simplify regex
       s/ /_/g;						#change any spaces in datastore names to underscores       to simplify regex
       s/\(/_/g;						#change any ( characters in datastore names to underscores to simplify regex
       s/\)/_/g;						#change any ) characters in datastore names to underscores to simplify regex
@@ -378,7 +378,7 @@ sub get_datastores {
       s/\]\}//g;					#get rid of footer
       s/\{//g;						#get rid of opening { 
       s/\}/\n/g;					#replace closing } with \n new line character , which will be used as a unique identifier for splitting up each datastore 
-      @_ = split /\n/,$_;				#split the XML output on the arbitrary \n string, putting each chunk of data into a separate array element
+      @_ = split /\n/,$_;				#split the JSON output on the arbitrary \n string, putting each chunk of data into a separate array element
    }							#end of while loop
    close IN;						#close filehandle
    #
@@ -391,7 +391,7 @@ sub get_datastores {
    #    datastore:datastore-4724,name:esx1_datastore1,type:VMFS,free_space:1561255215104,capacity:2040377901056
    #
    foreach (@_) {
-      if ( /datastore:([a-zA-Z0-9\-]+),name:([a-zA-Z0-9_\-]+),type:([A-Z]+),free_space:([0-9]+),capacity:([0-9]+)/ ) { #parse out each field in the XML data returned by the API query
+      if ( /datastore:([a-zA-Z0-9\-]+),name:([a-zA-Z0-9_\-]+),type:([A-Z]+),free_space:([0-9]+),capacity:([0-9]+)/ ) { #parse out each field in the JSON data returned by the API query
          $datastores{$1}{id}         = $1;		#use the unique identifier for each datastore as the hash key
          $datastores{$1}{name}       = $2;
          $datastores{$1}{type}       = $3;
@@ -401,7 +401,7 @@ sub get_datastores {
          #
          # No one cares about datastore sizes in bytes, convert to TB
          #
-         $datastores{$1}{capacity_tb} = $datastores{$1}{capacity} /1024/1024/1024/1024;		#convert bytes to terabytes
+         $datastores{$1}{capacity_tb} = $datastores{$1}{capacity}   /1024/1024/1024/1024;	#convert bytes to terabytes
          $datastores{$1}{free_tb}     = $datastores{$1}{free_bytes} /1024/1024/1024/1024;	#convert bytes to terabytes
          $datastores{$1}{used_tb}     = $datastores{$1}{used_bytes} /1024/1024/1024/1024;	#convert bytes to terabytes
          $datastores{$1}{capacity_tb} = sprintf("%.1f",$datastores{$1}{capacity_tb});		#truncate to 1 decimal place
