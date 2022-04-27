@@ -35,7 +35,7 @@ define command {
        command_name    check_vmware_datastore
        command_line    $USER1$/check_vmware_datastore --host=$HOSTADDRESS$
        }
-
+```
 
 # Output
 <br><img src=images/output.png>
