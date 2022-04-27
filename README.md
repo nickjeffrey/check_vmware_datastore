@@ -26,7 +26,7 @@ define service {
         use                             generic-service
         host_name                       vcenter01.example.com
         service_description             VMWare datastores
-        check_command                   check_vmware_datastore
+        check_command                   check_vmware_datastore!10!5
         }
 ```
 
