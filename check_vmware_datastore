@@ -1,0 +1,489 @@
+#!/usr/bin/perl -w
+
+
+
+# This is a nagios script will check the free space in VMWare datastores on a VMWare host
+
+
+# OUSTANDING TASKS
+# ----------------
+# document how/why --warn=10 --critical=5 values are in %, consider adding GB option
+
+
+
+# CHANGE LOG
+# ----------
+#  2022/04/14	njeffrey	Script created
+
+
+# NOTES
+# -----
+
+
+
+
+
+# PREREQUISITES
+# -------------
+#
+#   1) You must have a valid username/password to login into vCenter (a low-privilege read-only account is fine)
+#      For example: cat /usr/local/nagios/etc/private/vcenter.auth
+#      username=nagios@vsphere.local
+#      password=MySecretPass
+#
+#
+#   2) You will need a section similar to the following in the commands.cfg file on the nagios server.
+#      # ---------------------------------------------------------------------------
+#      # 'check_vmware_datastore' command definition
+#      define command {
+#             command_name    check_vmware_datastore
+#             command_line    $USER1$/check_vmware_api $HOSTADDRESS$ 
+#             }
+#
+#
+#
+#   3) You will need a section similar to the following in the services.cfg file on the nagios server.
+#      define service {
+#              use                             generic-24x7-service
+#              host_name                       vmhost1.example.com
+#              service_description             VMWare datastores 
+#              check_interval                  30              ; Actively check the host every 30 minutes
+#              check_command                   check_vmware_datastore
+#              }
+
+
+
+
+#
+#
+# TROUBLESHOOTING
+# ---------------
+
+
+
+
+
+#
+#
+use strict;							#enforce good coding practices
+use Getopt::Long;                       			#allow --long-switches to be used as parameters
+
+
+my ($host,$username,$password);
+my (%datastores,$datastore,$datastore_count);
+my ($total_tb,$free_tb,$used_tb);
+my ($total_pct,$free_pct,$used_pct,$thresh_warn,$thresh_crit);
+my ($opt_w,$opt_c,$opt_h,$opt_H,$opt_v,$opt_d,$verbose);
+my ($sessionid,$curl,$ping,$nslookup,$nslookup_status,$cmd,$key,$common_output_data);
+my ($output_message,$output_filename,$output_file_age);
+my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,$atime,$mtime,$ctime,$blksize,$blocks);
+my ($credsfile,$perf_data);
+my ($OK,$WARN,$CRITICAL,$UNKNOWN,$CHECK_NAME);
+#
+#declare variables
+$host                    = "";					#initialize variable
+$curl                    = "/usr/bin/curl";			#location of binary on nagios server
+$ping                    = "/bin/ping";				#location of binary on nagios server
+$nslookup                = "/usr/bin/nslookup";			#location of binary on nagios server
+$nslookup_status         = "";					#flag for checking to see if nslookup test succeeds
+$datastore_count         = 0; 					#initialize counter for number of total   datastores
+$credsfile               = "/usr/local/nagios/etc/private/vcenter.auth";  #file containing vCenter username/password for connecting to API
+$verbose                 = "no";				#for debugging (yes=show more print output) 
+$thresh_warn             = 5;					#default low space percentage to send warning  message
+$thresh_crit             = 4;					#default low space percentage to send critical message
+$CHECK_NAME              = "VMWare datastores";			#descriptive name of nagios check
+#
+# Nagios return codes
+#
+$OK=            0;                            		  	#this script returns a value to nagios for processing
+$WARN=          1;                          		    	#this script returns a value to nagios for processing
+$CRITICAL=      2;                              		#this script returns a value to nagios for processing
+$UNKNOWN=       3;                              		#this script returns a value to nagios for processing
+
+
+
+
+sub get_options {
+   #
+   # this gets the command line parameters provided by the users
+   #
+   print "running get_options subroutine \n" if ($verbose eq "yes");
+   #
+   Getopt::Long::Configure('bundling');
+   GetOptions(
+      "h"   => \$opt_h, "help"        => \$opt_h,
+      "v"   => \$opt_v, "verbose"     => \$opt_v,
+      "w=i" => \$opt_w, "warn=i"      => \$opt_w,
+      "c=i" => \$opt_c, "critical=i"  => \$opt_c,
+      "H=s" => \$opt_H, "host=s"      => \$opt_H,
+      "d=s" => \$opt_d, "datastore=s" => \$opt_d,
+   );
+   #
+   #
+   #
+   # If the user supplied -h or --help, generate the help messages
+   # Also generate the help message if the -H or  --host=xxx parameter was not provided
+   if( (defined($opt_h)) || (!defined($opt_H)) ) {
+      print "Nagios plugin for determining filesystem usage. \n";
+      print "Examples: \n";
+      print "   $0 --help    \n";
+      print "   $0 --verbose --host=vcenter01.example.com --warn=10 --critical=5 --datastore=mydatastore \n";
+      print "\n\n";
+      exit $UNKNOWN;
+   }
+   #
+   #
+   #
+   # If the user supplied -H or --host=xxx switch, define the vCenter host we willc connect to
+   if( defined( $opt_H ) ) {
+      $host = $opt_H;
+   }
+   #
+   # If the user supplied -d or --datastore=xxx switch, define the vCenter host we willc connect to
+   if( defined( $opt_d ) ) {
+      $datastore = $opt_d;
+   }
+   #
+   # If the user supplied -v or --verbose switch, use verbose output for debugging
+   if( defined( $opt_v ) ) {
+      $verbose = "yes";
+   }
+   #
+   # If the user supplied -c or --critical switch, set the threshold
+   if( defined( $opt_c ) ) {
+      $thresh_crit = $opt_c;
+      print "   --critical=$thresh_crit \n" if ($verbose eq "yes");
+   }
+   # If the user supplied -w or --warn, set the threshold
+   if( defined( $opt_w ) ) {
+      $thresh_warn = $opt_w;
+      print "   --warn=$thresh_warn \n" if ($verbose eq "yes");
+   }
+}                       #end of subroutine
+
+
+
+
+sub sanity_checks {
+   # 
+   print "running sanity_checks subroutine \n" if ($verbose eq "yes");
+   #
+   # Check to see what userid the script is running as
+   #
+   print "  $0 script is running in the security context of the $ENV{USER} user \n" if ($verbose eq "yes");
+   # 
+   # confirm user specified a command line parameter for the hostname
+   #  
+   #
+   # confirm ping exists
+   if ( ! -f "$ping" ) {
+      print "$CHECK_NAME WARN: Cannot find $ping \n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   if ( ! -x "$ping" ) {
+      print "$CHECK_NAME WARN: ping is not executable by the current user\n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   #
+   # confirm curl exists
+   if ( ! -f "$curl" ) {
+      print "$CHECK_NAME WARN: Cannot find $curl \n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   if ( ! -x "$curl" ) {
+      print "$CHECK_NAME WARN: curl is not executable by the current user\n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   #
+   # confirm nslookup exists
+   if ( ! -f "$nslookup" ) {
+      print "$CHECK_NAME WARN: Cannot find $nslookup \n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   if ( ! -x "$nslookup" ) {
+      print "$CHECK_NAME WARN: $nslookup is not executable by the current user\n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   #
+   # confirm $credsfile exists
+   if ( ! -f "$credsfile" ) {
+      print "$CHECK_NAME WARN: Cannot find $credsfile \n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   if ( ! -r "$credsfile" ) {
+      print "$CHECK_NAME WARN: $credsfile is not executable by the current user\n";
+      exit $WARN;					#exit script
+   }							#end of if block
+   # 
+   # Confirm $thresh_warn and $thresh_crit are reasonable valuse
+   # We do not allow values of 0 or 100, because warning on 0% free is already completely full, and 100% is an empty datastore.
+   unless ( ($thresh_warn >= 1) && ($thresh_warn <= 99) ) {
+      print "$CHECK_NAME WARN: warning threshold $thresh_warn must be between 1 and 99\n";
+      exit $WARN;					#exit script
+   }							#end of unless block
+   unless ( ($thresh_crit >= 1) && ($thresh_crit <= 99) ) {
+      print "$CHECK_NAME WARN: critical threshold $thresh_crit must be between 1 and 99\n";
+      exit $WARN;					#exit script
+   }							#end of unless block
+   unless ( $thresh_warn > $thresh_crit ) {
+      print "$CHECK_NAME WARN: warning threshold of $thresh_warn\% free must be larger than critical threshold $thresh_crit\% free \n";
+      exit $WARN;					#exit script
+   }							#end of unless block
+}							#end of subroutine
+
+
+
+
+
+
+
+
+sub check_name_resolution {
+   #
+   print "running check_name_resolution subroutine \n" if ($verbose eq "yes");
+   #
+   # confirm valid name resolution exists for $host
+   #
+   $cmd = "$nslookup $host";						#define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   if( ! open( NSLOOKUP, "$cmd 2>&1|" ) ) {
+      warn "WARNING: $cmd failed: $!\n";
+      return 0;
+   }
+   while (<NSLOOKUP>) {                        					#read a line from STDIN
+      if (/failed/) {								#look for error message from nslookup
+         $nslookup_status = "failed";						#set flag value for $nslookup variable
+      }										#end of if block
+      if (/SERVFAIL/) {								#look for error message from nslookup
+         $nslookup_status = "failed";						#set flag value for $nslookup variable
+      }										#end of if block
+   }										#end of while loop
+   close NSLOOKUP;								#close filehandle
+   if ( $nslookup_status eq "failed" ) {					#check for flag value
+      print "$CHECK_NAME CRITICAL: no name resolution for $host - please add $host to DNS \n";
+      exit $CRITICAL;
+   }										#end of if block
+}
+
+
+
+sub ping_vcenter_host {
+   #
+   print "running ping_vcenter_host subroutine \n" if ($verbose eq "yes");
+   #
+   $cmd = "$ping -c 2 $host";							#define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");                         				#open filehandle using command output
+   while (<IN>) { 								#read a line from filehandle
+      if (/100\% packet loss/) { 						#see if all the pings failed
+         print "$CHECK_NAME WARN - no ping reply from vCenter host $host \n";
+         exit $WARN;
+      }
+      if (/unknown host/) { 							#see if all the pings failed
+         print "$CHECK_NAME WARN - no valid name resolution for vCenter host $host  \n";
+         exit $WARN;
+      }
+   } 										#end of while loop
+   close IN; 									#close filehandle
+} 										#end of subroutine 
+
+
+
+
+
+
+sub verify_credentials {
+   #
+   print "running verify_credentials subroutine \n" if ($verbose eq "yes");
+   #
+   # This command will confirm that we are using valid username/password credentials 
+   #
+   print "   opening $credsfile file to read vCenter credentials \n" if ($verbose eq "yes");
+   open (IN,"$credsfile") or die "Cannot open $credsfile file containing vCenter username/password. $! \n";        #open file for reading
+   while (<IN>) { 						#read a line from filehandle
+      $username = $1 if ( /^username=([a-zA-Z0-9\@\.]+)/ ); 	#parse out the username
+      $password = $1 if ( /^password=(.*+)/ );         	#parse out the password
+   }
+   close IN;
+   print "   username=$username password=$password \n" if ($verbose eq "yes");
+   unless (defined($username)) {
+      print "$CHECK_NAME UNKNOWN - could not determine username to connect to vCenter \n";
+      exit $UNKNOWN;
+   }
+   unless (defined($password)) {
+      print "$CHECK_NAME UNKNOWN - could not determine password to connect to vCenter \n";
+      exit $UNKNOWN;
+   }
+   #
+   # Connect to vCenter 
+   #
+   $cmd = "$curl -s -k -X POST https://$host/rest/com/vmware/cis/session -u \"$username:$password\"";           #define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");             	                #open filehandle using command output
+   while (<IN>) {                                       #read a line from filehandle
+      s/"//g;						#get rid of " characters to make the regex simpler
+      if ( /value:([a-zA-Z0-9]+)/ ) {			#send credentials to the VMware API and retrieve the SESSIONID 
+         $sessionid = $1;				#save the SESSIONID to a variable, will be used for all subsequent API requests
+         print "   sessionid=$sessionid \n" if ($verbose eq "yes");
+      }							#end of if block
+   }							#end of while loop
+   close IN;						#close filehandle
+   # confirm we received a SESSIONID
+   unless (defined($sessionid)) {
+      print "$CHECK_NAME UNKNOWN - did not receive SESSIONID from VMware API authentication request \n";
+      exit $UNKNOWN;
+   }
+} 							#end of subroutine 
+
+
+
+sub get_datastores {
+   #
+   print "running get_datastores subroutine \n" if ($verbose eq "yes");
+   #
+   # The API request will return output similar to the following.  
+   # Note that line breaks are only added for readability, the actual returned text will all be one line.
+   # {"value":[
+   #             {"datastore":"datastore-10683","name":"esx2_datastore2","type":"VMFS","free_space":2200181932032,"capacity":4000762036224},
+   #             {"datastore":"datastore-1484","name":"esx2_datastore1","type":"VMFS","free_space":536811143168,"capacity":1016028200960},
+   #             {"datastore":"datastore-4723","name":"esx1_datastore2","type":"VMFS","free_space":2753715765248,"capacity":4000762036224},
+   #             {"datastore":"datastore-4724","name":"esx1_datastore1","type":"VMFS","free_space":1561255215104,"capacity":2040377901056}
+   #          ]}
+   #
+   $cmd = "$curl -k -X GET -H \"vmware-api-session-id: $sessionid\" https://$host/rest/vcenter/datastore ";			#define command to be run
+   print "   running $cmd \n" if ($verbose eq "yes");
+   open (IN,"$cmd 2>&1|");                             	#open filehandle using command output
+   while (<IN>) {                                       #read a line from filehandle
+      s/"//g;						#get rid of " characters to make the regex simpler
+      s/\{value:\[//g;					#get rid of header
+      s/\]\}//g;					#get rid of footer
+      s/\{//g;						#get rid of opening { 
+      s/\}/____/g;					#replace closing } with ____ , which will be used as a unique identifier for splitting up each datastore 
+      @_ = split /____/,$_;				#split the XML output on the arbitrary ____ string, putting each chunk of data into a separate array element
+   }							#end of while loop
+   close IN;						#close filehandle
+   #
+   # At this point, we have the details of each datastore in the @_ array, with each array element containing data similar to the following.
+   # In other words, each array element contains multile key:value pairs, which we would very much like to be able to address separately, 
+   # so the next sectionw will take those key:value pairs and bring them into a hash.
+   #    datastore:datastore-0683,name:esx2_datastore2,type:VMFS,free_space:2200181932032,capacity:4000762036224
+   #    datastore:datastore-1484,name:esx2_datastore1,type:VMFS,free_space:536811143168,capacity:1016028200960
+   #    datastore:datastore-4723,name:esx1_datastore2,type:VMFS,free_space:2753715765248,capacity:4000762036224
+   #    datastore:datastore-4724,name:esx1_datastore1,type:VMFS,free_space:1561255215104,capacity:2040377901056
+   #
+   foreach (@_) {
+      if ( /datastore:([a-zA-Z0-9\-]+),name:([a-zA-Z0-9_\-]+),type:([A-Z]+),free_space:([0-9]+),capacity:([0-9]+)/ ) { #parse out each field in the XML data returned by the API query
+         $datastores{$1}{id}         = $1;		#use the unique identifier for each datastore as the hash key
+         $datastores{$1}{name}       = $2;
+         $datastores{$1}{type}       = $3;
+         $datastores{$1}{free_bytes} = $4;
+         $datastores{$1}{capacity}   = $5;
+         $datastores{$1}{used_bytes} = $datastores{$1}{capacity} - $datastores{$1}{free_bytes}; #we know the capacity and free, use that to calculate used bytes
+         #
+         # No one cares about datastore sizes in bytes, convert to TB
+         #
+         $datastores{$1}{capacity_tb} = $datastores{$1}{capacity} /1024/1024/1024/1024;		#convert bytes to terabytes
+         $datastores{$1}{free_tb}     = $datastores{$1}{free_bytes} /1024/1024/1024/1024;	#convert bytes to terabytes
+         $datastores{$1}{used_tb}     = $datastores{$1}{used_bytes} /1024/1024/1024/1024;	#convert bytes to terabytes
+         $datastores{$1}{capacity_tb} = sprintf("%.1f",$datastores{$1}{capacity_tb});		#truncate to 1 decimal place
+         $datastores{$1}{free_tb}     = sprintf("%.1f",$datastores{$1}{free_tb});		#truncate to 1 decimal place
+         $datastores{$1}{used_tb}     = sprintf("%.1f",$datastores{$1}{used_tb});		#truncate to 1 decimal place
+         #
+         # Figure out the percentage used and free space
+         #
+         $datastores{$1}{free_pct} = $datastores{$1}{free_bytes} / $datastores{$1}{capacity} * 100; 	#convert to percentage
+         $datastores{$1}{free_pct} = sprintf("%.1f",$datastores{$1}{free_pct});		  	#truncate to 1 decimal place
+         $datastores{$1}{used_pct} = 100 - $datastores{$1}{free_pct}; 				#convert to percentage
+         $datastores{$1}{used_pct} = sprintf("%.1f",$datastores{$1}{used_pct});		  	#truncate to 1 decimal place
+         #
+         print "   id=$datastores{$1}{id} name=$datastores{$1}{name} type=$datastores{$1}{type} capacity=$datastores{$1}{capacity_tb}TB used=$datastores{$1}{used_tb}TB ($datastores{$1}{used_pct}\%), free=$datastores{$1}{free_tb}TB ($datastores{$1}{free_pct}\%) \n" if ($verbose eq "yes");
+      }
+   }
+   close IN;                                            #close filehandle
+   #
+   # 
+   # By default, we assume that all datastors are being checked.
+   # However, if --datastore=xxx was provided as a command line parameter, only check that single datastore
+   # 
+   if ( defined($datastore) ) {
+      foreach $key (keys %datastores) {
+         unless ( $datastores{$key}{name} eq "$datastore" ) {
+            delete($datastores{$key});			#delete this datastore from the hash    
+         }						#end of unless block
+      }							#end of foreach loop
+   } 							#end of if block
+   # 
+   # figure out the total number of datastores
+   $datastore_count = keys %datastores;
+} 							#end of subroutine 
+
+
+
+
+
+
+
+
+
+
+sub print_output {
+   #
+   print "running print_output subroutine \n" if ($verbose eq "yes");
+   #
+   # The nagios performance data will be the same for all the outputs, so just put it in a variable that can be use by all the output options
+   # The format is:  label=value[UOM];[warn];[crit];[min];[max]
+   # On the "label=value" section is required.  The warn|crit|min|max entries are optional.
+   # You can have multiple items of perf data, just separate each section with a space.
+   # If you are pnp4nagios for graphing, each space-separated section will create a separate graph.
+   # UOM is Units Of Measurement.    Can be s=seconds B=bytes MB=megabytes GB=gigabytes %=percent c=counter
+   $perf_data          = "";							#initialize variable
+   $common_output_data = "";							#initialize variable
+   foreach $key (keys %datastores) {
+      $perf_data = "$perf_data $datastores{$key}{name}_used_tb:$datastores{$key}{used_tb}TB;;;0;$datastores{$key}{capacity_tb}  $datastores{$key}{name}_used_pct:$datastores{$key}{used_pct}\%;;;0;100 "; 
+   }
+   #
+   #
+   if ( $datastore_count == 0 ) {
+      print "$CHECK_NAME UNKNOWN - no datastores found \n";
+      exit $UNKNOWN;
+   }							#end of if block
+   foreach $key (keys %datastores) {
+      $common_output_data = "$common_output_data , $datastores{$key}{name}:$datastores{$key}{used_tb}TB/$datastores{$key}{capacity_tb}TB($datastores{$key}{used_pct}\% used) "; 	#common text in each message
+   }
+   #
+   foreach $key (keys %datastores) {
+      #next unless (  $datastores{$key}{free_pct} );	#skip any blank hash elements
+      unless ( $datastores{$key}{free_pct} ) {		#check to see if hash element is undefined
+         print "$CHECK_NAME UNKNOWN - Could not determine free space in datastore $datastores{$key}{name}.  $common_output_data | $perf_data \n";
+         exit $UNKNOWN;
+      } 						#end of unless block
+      if ( $datastores{$key}{free_pct} < $thresh_crit ) {
+         print "$CHECK_NAME CRITICAL - Datastore $datastores{$key}{name} is low on space.  $common_output_data | $perf_data \n";
+         exit $CRITICAL;
+      }
+      if ( $datastores{$key}{free_pct} < $thresh_warn ) {
+         print  "$CHECK_NAME WARN - Datastore $datastores{$key}{name} is low on space.  $common_output_data | $perf_data \n";
+         exit $WARN;
+      }
+   }       
+   #
+   # We only get this far if everything is ok
+   #
+   print "$CHECK_NAME OK - $common_output_data | $perf_data \n";	#print output to screen
+   exit $OK;
+}                                                                       #end of subroutine
+
+
+
+
+
+# --  main body of script -------------------------------------------------
+get_options;
+sanity_checks;
+check_name_resolution;
+ping_vcenter_host;
+verify_credentials;
+get_datastores;
+print_output;
+
+
