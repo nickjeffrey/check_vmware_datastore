@@ -16,6 +16,7 @@
 #  2022/04/14	njeffrey	Script created
 #  2022/04/27	njeffrey	Adjust regex to allow [\(\) ] in datastore names
 #  2022/04/27	njeffrey	Add --include=xxx --exclude=xxx parameters
+#  2022/05/11	njeffrey	Bug fix.  Add --silent parameter to curl to prevent extraneous linebreaks that were breaking regex
 
 
 # NOTES
@@ -366,21 +367,24 @@ sub get_datastores {
    #             {"datastore":"datastore-4724","name":"esx1_datastore1","type":"VMFS","free_space":1561255215104,"capacity":2040377901056}
    #          ]}
    #
-   $cmd = "$curl -k -X GET -H \"vmware-api-session-id: $sessionid\" https://$host/rest/vcenter/datastore ";			#define command to be run
+   $cmd = "$curl --silent -k -X GET -H \"vmware-api-session-id: $sessionid\" https://$host/rest/vcenter/datastore ";			#define command to be run
    print "   running $cmd \n" if ($verbose eq "yes");
    open (IN,"$cmd 2>&1|");                             	#open filehandle using command output
+  # open (IN,"/tmp/datastore.txt") or die "Cannot open /tmp/datastore.txt $! \n";                             	#open text file for reading
    while (<IN>) {                                       #read a line from filehandle
-      s/"//g;						#get rid of " characters in JSON outpout                    to simplify regex
+      s/"//g;						#get rid of " characters in JSON outpout                   to simplify regex
+      s/\{value:\[//g;					#get rid of header
+      s/\]\}//g;					#get rid of footer
       s/ /_/g;						#change any spaces in datastore names to underscores       to simplify regex
       s/\(/_/g;						#change any ( characters in datastore names to underscores to simplify regex
       s/\)/_/g;						#change any ) characters in datastore names to underscores to simplify regex
-      s/\{value:\[//g;					#get rid of header
-      s/\]\}//g;					#get rid of footer
       s/\{//g;						#get rid of opening { 
       s/\}/\n/g;					#replace closing } with \n new line character , which will be used as a unique identifier for splitting up each datastore 
       @_ = split /\n/,$_;				#split the JSON output on the arbitrary \n string, putting each chunk of data into a separate array element
+      print "   ---- $_ " if ($verbose eq "yes");
    }							#end of while loop
    close IN;						#close filehandle
+   @_ = sort @_;					#sort the array elements alphabetically
    #
    # At this point, we have the details of each datastore in the @_ array, with each array element containing data similar to the following.
    # In other words, each array element contains multile key:value pairs, which we would very much like to be able to address separately, 
@@ -391,6 +395,7 @@ sub get_datastores {
    #    datastore:datastore-4724,name:esx1_datastore1,type:VMFS,free_space:1561255215104,capacity:2040377901056
    #
    foreach (@_) {
+      #print "   $_ \n" if ($verbose eq "yes");
       if ( /datastore:([a-zA-Z0-9\-]+),name:([a-zA-Z0-9_\-]+),type:([A-Z]+),free_space:([0-9]+),capacity:([0-9]+)/ ) { #parse out each field in the JSON data returned by the API query
          $datastores{$1}{id}         = $1;		#use the unique identifier for each datastore as the hash key
          $datastores{$1}{name}       = $2;
@@ -529,7 +534,31 @@ sub print_output {
       $perf_data = "$perf_data $datastores{$key}{name}_used_tb:$datastores{$key}{used_tb}TB;;;0;$datastores{$key}{capacity_tb}  $datastores{$key}{name}_used_pct:$datastores{$key}{used_pct}\%;;;0;100 "; 
    }
    #
+   # figure out the total amount of free/used space across all datastores
    #
+   my %datastore_summary;
+   $datastore_summary{free_bytes} = 0;
+   $datastore_summary{used_bytes} = 0;
+   $datastore_summary{capacity} = 0;
+   foreach $key (keys %datastores) {
+      next unless $datastores{$key}{free_bytes};								#skip any missing hash elements
+      next unless $datastores{$key}{used_bytes};								#skip any missing hash elements
+      next unless $datastores{$key}{capacity};									#skip any missing hash elements
+      $datastore_summary{free_bytes} = $datastore_summary{free_bytes} + $datastores{$key}{free_bytes};		#running tally
+      $datastore_summary{used_bytes} = $datastore_summary{used_bytes} + $datastores{$key}{used_bytes};		#running tally
+      $datastore_summary{capacity}   = $datastore_summary{capacity}   + $datastores{$key}{capacity};		#running tally
+   }
+   # No one cares about datastore sizes in bytes, convert to TB
+   #
+   $datastore_summary{capacity_tb} = $datastore_summary{capacity}   /1024/1024/1024/1024;      		 	#convert bytes to terabytes
+   $datastore_summary{free_tb}     = $datastore_summary{free_bytes} /1024/1024/1024/1024;       		#convert bytes to terabytes
+   $datastore_summary{used_tb}     = $datastore_summary{used_bytes} /1024/1024/1024/1024;      			#convert bytes to terabytes
+   $datastore_summary{capacity_tb} = sprintf("%.1f",$datastore_summary{capacity_tb});           		#truncate to 1 decimal place
+   $datastore_summary{free_tb}     = sprintf("%.1f",$datastore_summary{free_tb});               		#truncate to 1 decimal place
+   $datastore_summary{used_tb}     = sprintf("%.1f",$datastore_summary{used_tb});               		#truncate to 1 decimal place
+   # 
+   # 
+   # 
    if ( $datastore_count == 0 ) {
       print "$CHECK_NAME UNKNOWN - no datastores found \n";
       exit $UNKNOWN;
@@ -538,6 +567,7 @@ sub print_output {
       next unless $datastores{$key}{name};					#skip any missing hash elements
       $common_output_data = "$common_output_data , $datastores{$key}{name}:$datastores{$key}{used_tb}TB/$datastores{$key}{capacity_tb}TB($datastores{$key}{used_pct}\% used) "; 	#common text in each message
    }
+   $common_output_data = "$common_output_data , Total datastore count:$datastore_count , Total datastore size:$datastore_summary{capacity_tb}TB used:$datastore_summary{used_tb}TB free:$datastore_summary{free_tb}TB ";
    #
    # find the ok|warn|critical|unknown status of each datastore
    #
@@ -576,7 +606,7 @@ sub print_output {
    }
    # We only get this far if everything is ok
    #
-   print "$CHECK_NAME OK - all datastores have sufficient free space.  $common_output_data | $perf_data \n";	#print output to screen
+   print "$CHECK_NAME OK - all $datastore_count datastores have sufficient free space.  $common_output_data | $perf_data \n";	#print output to screen
    exit $OK;
 }                                                                       #end of subroutine
 
