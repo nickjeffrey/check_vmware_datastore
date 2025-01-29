@@ -12,6 +12,17 @@ Assign the Read-Only role.  This makes the nagios user on vCenter a low-privileg
 <br><img src=images/vcenter_user_role.png>
 
 
+Copy the check script to the plugins directory
+```
+su - nagios
+cd /tmp
+git clone https://github.com/nickjeffrey/check_vmware_datastore
+cd check_vmware_datastore
+cp check_vmware_datastore     /usr/local/nagios/libexec/check_vmware_datastore
+chown nagios:nagios           /usr/local/nagios/libexec/check_vmware_datastore
+chmod 755                     /usr/local/nagios/libexec/check_vmware_datastore
+```
+
 Create the /usr/local/nagios/etc/private/vcenter.auth file with the credentials for the above user
 ```
 username=nagios@vsphere.local
